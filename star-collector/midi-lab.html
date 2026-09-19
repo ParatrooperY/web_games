@@ -1,0 +1,321 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MIDI 解构实验室</title>
+  <link rel="stylesheet" href="game.css">
+  <style>
+    .lab-title { margin:18px 0 6px; }
+    .lab-sub { color:var(--muted); margin:0 0 14px; font-size:.9rem; }
+    #dropzone { border:1px dashed #34435b; border-radius:12px; padding:14px; text-align:center; color:var(--muted); margin-bottom:14px; }
+    #dropzone.over { border-color:var(--gold); color:var(--gold); }
+    .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; margin-bottom:14px; }
+    .card { background:#111b2b; border:1px solid #23334b; border-radius:10px; padding:10px 12px; }
+    .card .k { color:var(--muted); font-size:.78rem; }
+    .card .v { font-size:1.15rem; margin-top:4px; word-break:break-all; }
+    .track-row { display:flex; align-items:center; gap:10px; background:#111b2b; border:1px solid #23334b; border-radius:10px; padding:8px 12px; margin-bottom:8px; }
+    .track-row .dot { width:12px; height:12px; border-radius:50%; flex:none; }
+    .track-row .info { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .track-row .info small { color:var(--muted); }
+    .player-bar { display:flex; align-items:center; gap:14px; margin:14px 0 8px; }
+    .player-bar .hint { text-align:left; margin:0; }
+    #roll { display:block; width:100%; height:380px; background:#070d1b; border:1px solid #23334b; border-radius:12px; cursor:crosshair; }
+  </style>
+</head>
+<body>
+  <main class="game-shell">
+    <header class="game-top"><a href="./">← 返回游戏</a></header>
+    <h1 class="lab-title">MIDI 解构实验室</h1>
+    <p class="lab-sub">MIDI 不是声音，是一份机器乐谱：什么时间、哪个键、按多重、按多久。这里把乐谱摊开看。</p>
+    <div id="dropzone">把本地 .mid 文件拖进来拆，默认已加载内置卡农</div>
+    <section id="overview" class="cards"></section>
+    <section id="tracks"></section>
+    <div class="player-bar">
+      <button id="btnPlay" class="primary" type="button">播放</button>
+      <button id="btnTimbre" class="text-button" type="button">音色：正弦波</button>
+      <span id="timeLabel">0:00 / 0:00</span>
+      <span class="hint">卷帘上：点音符单独发声，点空白跳转进度</span>
+    </div>
+    <canvas id="roll"></canvas>
+  </main>
+  <script src="midi.js"></script>
+  <script src="vendor/WebAudioFontPlayer.js"></script>
+  <script src="vendor/piano_FluidR3_GM.js"></script>
+  <script>
+  'use strict';
+
+  const COLORS = ['#ffd166', '#91e6ff', '#ef8354', '#c3aed6', '#8ac926', '#ff6b6b', '#48cae4', '#f4a261'];
+  const NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
+  const noteName = (p) => NOTE_NAMES[p % 12] + (Math.floor(p / 12) - 1);
+  const fmtTime = (s) => Math.floor(s / 60) + ':' + String(Math.floor(s % 60)).padStart(2, '0');
+
+  const roll = document.getElementById('roll');
+  const rctx = roll.getContext('2d');
+  const staticLayer = document.createElement('canvas');
+  const sctx = staticLayer.getContext('2d');
+
+  let song = null;       // { parsed, name, notes: [{...note, track}], duration, minP, maxP }
+  let muted = new Set();
+  let solo = new Set();
+  let actx = null;
+  let playing = false;
+  let offset = 0;        // 暂停/跳转时的歌曲进度
+  let startAt = 0;       // 播放起点对应的 actx.currentTime
+  let schedIdx = 0;
+
+  function $(id) { return document.getElementById(id); }
+
+  function tone(freq, dur, peak, when) {
+    const t = when ?? actx.currentTime;
+    const o = actx.createOscillator();
+    const g = actx.createGain();
+    o.type = 'sine';
+    o.frequency.value = freq;
+    g.gain.setValueAtTime(0, t);
+    g.gain.linearRampToValueAtTime(peak, t + 0.012);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.connect(g).connect(actx.destination);
+    o.start(t);
+    o.stop(t + dur + 0.02);
+  }
+  const noteFreq = (p) => 440 * Math.pow(2, (p - 69) / 12);
+
+  // 音色切换：正弦波（裸振荡器）/ 钢琴（FluidR3 SoundFont 波表合成）
+  let timbre = 'sine';
+  let wafPlayer = null;
+  $('btnTimbre').addEventListener('click', () => {
+    timbre = timbre === 'sine' ? 'piano' : 'sine';
+    $('btnTimbre').textContent = '音色：' + (timbre === 'sine' ? '正弦波' : '钢琴（FluidR3）');
+  });
+
+  function playNote(pitch, dur, peak, when) {
+    if (timbre === 'piano' && window._tone_0000_FluidR3_GM_sf2_file) {
+      if (!wafPlayer) wafPlayer = new WebAudioFontPlayer();
+      wafPlayer.queueWaveTable(actx, actx.destination, _tone_0000_FluidR3_GM_sf2_file,
+        when ?? actx.currentTime, pitch, Math.max(dur, 0.5), Math.min(1, peak * 5));
+    } else {
+      tone(noteFreq(pitch), dur, peak, when);
+    }
+  }
+
+  function ensureAudio() {
+    if (!actx) actx = new (window.AudioContext || window.webkitAudioContext)();
+    if (actx.state === 'suspended') actx.resume();
+  }
+
+  function trackAudible(ti) {
+    if (solo.size) return solo.has(ti);
+    return !muted.has(ti);
+  }
+
+  function loadSong(parsed, name) {
+    const notes = [];
+    let minP = 127, maxP = 0, duration = 0;
+    parsed.tracks.forEach((t, ti) => {
+      for (const n of t.notes) {
+        notes.push({ ...n, track: ti });
+        minP = Math.min(minP, n.pitch);
+        maxP = Math.max(maxP, n.pitch);
+        duration = Math.max(duration, n.time + n.dur);
+      }
+    });
+    notes.sort((a, b) => a.time - b.time);
+    song = { parsed, name, notes, duration, minP: Math.max(0, minP - 2), maxP: Math.min(127, maxP + 2) };
+    muted = new Set();
+    solo = new Set();
+    stopPlayback();
+    renderOverview();
+    renderTracks();
+    drawStatic();
+    drawFrame();
+  }
+
+  function renderOverview() {
+    const { parsed, name, notes, duration, minP, maxP } = song;
+    const usedTracks = parsed.tracks.filter((t) => t.notes.length).length;
+    const tempos = parsed.tempos || [];
+    const cards = [
+      ['文件', name],
+      ['格式 / 精度', `Type ${parsed.format} / ${parsed.division} tick每拍`],
+      ['轨道', `${usedTracks} 条有声（共 ${parsed.tracks.length} 条）`],
+      ['总音符', notes.length],
+      ['时长', fmtTime(duration)],
+      ['音域', `${noteName(minP)} – ${noteName(maxP)}`],
+      ['速度', tempos.length ? `${tempos[0].bpm} bpm${tempos.length > 1 ? `（变速 ${tempos.length - 1} 次）` : ''}` : '未知'],
+    ];
+    $('overview').innerHTML = cards.map(([k, v]) => `<div class="card"><div class="k">${k}</div><div class="v">${v}</div></div>`).join('');
+  }
+
+  function renderTracks() {
+    $('tracks').innerHTML = '';
+    song.parsed.tracks.forEach((t, ti) => {
+      if (!t.notes.length) return;
+      const avg = t.notes.reduce((s, n) => s + n.pitch, 0) / t.notes.length;
+      const row = document.createElement('div');
+      row.className = 'track-row';
+      row.innerHTML =
+        `<span class="dot" style="background:${COLORS[ti % COLORS.length]}"></span>` +
+        `<span class="info">${t.name || '（未命名轨）'} <small>${t.notes.length} 音 ・ 平均音高 ${noteName(Math.round(avg))}</small></span>` +
+        `<button class="text-button" data-a="mute">${muted.has(ti) ? '已静音' : '静音'}</button>` +
+        `<button class="text-button" data-a="solo">${solo.has(ti) ? '取消独奏' : '独奏'}</button>`;
+      row.querySelector('[data-a="mute"]').addEventListener('click', () => {
+        muted.has(ti) ? muted.delete(ti) : muted.add(ti);
+        renderTracks(); drawStatic();
+      });
+      row.querySelector('[data-a="solo"]').addEventListener('click', () => {
+        solo.has(ti) ? solo.delete(ti) : solo.add(ti);
+        renderTracks(); drawStatic();
+      });
+      $('tracks').appendChild(row);
+    });
+  }
+
+  // ---------- 钢琴卷帘 ----------
+  function resizeRoll() {
+    const w = roll.clientWidth;
+    const scale = Math.min(window.devicePixelRatio || 1, 2);
+    roll.width = w * scale;
+    roll.height = 380 * scale;
+    rctx.setTransform(scale, 0, 0, scale, 0, 0);
+    staticLayer.width = roll.width;
+    staticLayer.height = roll.height;
+    sctx.setTransform(scale, 0, 0, scale, 0, 0);
+    if (song) drawStatic();
+  }
+
+  const xOf = (t) => (t / song.duration) * roll.clientWidth;
+  const yOf = (p) => ((song.maxP - p) / (song.maxP - song.minP + 1)) * 360 + 10;
+
+  function drawStatic() {
+    const w = roll.clientWidth, h = 380;
+    sctx.clearRect(0, 0, w, h);
+    // 八度参考线（每个 C）
+    sctx.font = '10px sans-serif';
+    for (let p = Math.ceil(song.minP / 12) * 12; p <= song.maxP; p += 12) {
+      const y = yOf(p);
+      sctx.strokeStyle = 'rgba(103,150,220,.15)';
+      sctx.beginPath(); sctx.moveTo(0, y); sctx.lineTo(w, y); sctx.stroke();
+      sctx.fillStyle = 'rgba(168,183,209,.5)';
+      sctx.fillText(noteName(p), 4, y - 2);
+    }
+    for (const n of song.notes) {
+      const audible = trackAudible(n.track);
+      sctx.globalAlpha = audible ? 0.9 : 0.15;
+      sctx.fillStyle = COLORS[n.track % COLORS.length];
+      const x = xOf(n.time), y = yOf(n.pitch);
+      const nw = Math.max(1.5, xOf(n.time + n.dur) - x - 0.5);
+      sctx.fillRect(x, y - 3, nw, 6);
+    }
+    sctx.globalAlpha = 1;
+  }
+
+  function drawFrame() {
+    rctx.clearRect(0, 0, roll.clientWidth, 380);
+    rctx.drawImage(staticLayer, 0, 0, roll.clientWidth, 380);
+    if (song && playing) {
+      const t = songTime();
+      const x = xOf(t);
+      rctx.strokeStyle = '#ffe59b';
+      rctx.lineWidth = 1.5;
+      rctx.beginPath(); rctx.moveTo(x, 0); rctx.lineTo(x, 380); rctx.stroke();
+    }
+  }
+
+  // ---------- 播放 ----------
+  function songTime() { return playing ? actx.currentTime - startAt + offset : offset; }
+
+  function stopPlayback() {
+    playing = false;
+    offset = 0;
+    if (actx && actx.state === 'running') actx.suspend();
+    $('btnPlay').textContent = '播放';
+    updateTimeLabel();
+  }
+
+  function updateTimeLabel() {
+    $('timeLabel').textContent = song ? `${fmtTime(songTime())} / ${fmtTime(song.duration)}` : '0:00 / 0:00';
+  }
+
+  $('btnPlay').addEventListener('click', () => {
+    if (!song) return;
+    ensureAudio();
+    if (playing) {
+      offset = songTime();
+      playing = false;
+      actx.suspend();
+      $('btnPlay').textContent = '播放';
+    } else {
+      if (offset >= song.duration) offset = 0;
+      startAt = actx.currentTime;
+      schedIdx = song.notes.findIndex((n) => n.time >= offset);
+      if (schedIdx < 0) schedIdx = song.notes.length;
+      playing = true;
+      $('btnPlay').textContent = '暂停';
+    }
+  });
+
+  function tick() {
+    if (playing && song) {
+      const ahead = songTime() + 0.3;
+      while (schedIdx < song.notes.length && song.notes[schedIdx].time < ahead) {
+        const n = song.notes[schedIdx++];
+        if (trackAudible(n.track)) {
+          playNote(n.pitch, Math.min(n.dur, 2), 0.12, startAt + n.time - offset);
+        }
+      }
+      if (songTime() >= song.duration) stopPlayback();
+      updateTimeLabel();
+    }
+    drawFrame();
+    requestAnimationFrame(tick);
+  }
+
+  // 点音符发声，点空白跳转
+  roll.addEventListener('click', (e) => {
+    if (!song) return;
+    const rect = roll.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+    const t = (x / rect.width) * song.duration;
+    const hit = song.notes.find((n) =>
+      t >= n.time - 0.02 && t <= n.time + n.dur + 0.02 && Math.abs(yOf(n.pitch) - y) <= 5);
+    ensureAudio();
+    if (hit) {
+      playNote(hit.pitch, Math.max(0.35, Math.min(hit.dur, 1.5)), 0.2);
+    } else {
+      offset = t;
+      if (playing) {
+        startAt = actx.currentTime;
+        schedIdx = song.notes.findIndex((n) => n.time >= offset);
+        if (schedIdx < 0) schedIdx = song.notes.length;
+      }
+      updateTimeLabel();
+    }
+  });
+
+  // ---------- 拖入文件 ----------
+  const dz = $('dropzone');
+  window.addEventListener('dragover', (e) => { e.preventDefault(); dz.classList.add('over'); });
+  window.addEventListener('dragleave', () => dz.classList.remove('over'));
+  window.addEventListener('drop', (e) => {
+    e.preventDefault();
+    dz.classList.remove('over');
+    const f = e.dataTransfer.files[0];
+    if (!f) return;
+    f.arrayBuffer()
+      .then((buf) => loadSong(MidiParse.parse(buf), f.name))
+      .catch(() => { dz.textContent = '解析失败：不是有效的 MIDI 文件'; });
+  });
+
+  window.addEventListener('resize', resizeRoll);
+  resizeRoll();
+  requestAnimationFrame(tick);
+
+  fetch('../assets/canon.mid')
+    .then((r) => { if (!r.ok) throw new Error(); return r.arrayBuffer(); })
+    .then((buf) => loadSong(MidiParse.parse(buf), '卡农（D 大调）'))
+    .catch(() => { dz.textContent = '内置卡农加载失败（本地文件模式下请直接拖入 .mid 文件）'; });
+  </script>
+</body>
+</html>
