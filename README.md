@@ -2,7 +2,7 @@
 
 纯静态的浏览器小游戏合集，不用安装、点开就玩。当前包含一款游戏：**小熊猫摘星星**。
 
-在线访问：<https://paratroopery.github.io/web_games/>
+在线访问：[摸鱼小游戏合集](https://paratroopery.github.io/web_games/)
 
 完整玩法与设计取舍见 [设计文档](docs/DESIGN.md)。
 
